@@ -5,7 +5,6 @@ import re
 RAILWAY_GRAPHQL = "https://backboard.railway.app/graphql/v2"
 
 def clean_repo(url_or_name: str) -> str:
-    """تبدیل انواع آدرس گیت‌هاب به فرمت owner/repo"""
     text = url_or_name.strip()
     text = re.sub(r'^https?://github\.com/', '', text)
     text = re.sub(r'\.git$', '', text)
@@ -13,7 +12,7 @@ def clean_repo(url_or_name: str) -> str:
 
 def execute_query(token: str, query: str, variables: dict = None):
     headers = {
-        "Authorization": f"Bearer {token}",
+        "Authorization": f"Bearer {token.strip()}",
         "Content-Type": "application/json"
     }
     resp = requests.post(
@@ -23,96 +22,57 @@ def execute_query(token: str, query: str, variables: dict = None):
         timeout=30
     )
     if resp.status_code != 200:
-        raise Exception(f"خطای ارتباط با سرور Railway (کد {resp.status_code})")
-    
+        raise Exception(f"خطای سرور Railway (کد {resp.status_code})")
     data = resp.json()
     if "errors" in data and data["errors"]:
-        error_msg = data["errors"][0].get("message", "خطای ناشناخته در Railway")
-        raise Exception(error_msg)
+        raise Exception(data["errors"][0].get("message", "خطای دسترسی در Railway"))
     return data.get("data", {})
 
+def check_token(token: str):
+    """اعتبارسنجی انواع توکن‌های Personal یا Workspace"""
+    # روش اول
+    try:
+        data = execute_query(token, "query { me { id email name } }")
+        if data and data.get("me"):
+            return data.get("me")
+    except Exception:
+        pass
+
+    # روش دوم
+    try:
+        data = execute_query(token, "query { workspaces { id name } }")
+        if data and data.get("workspaces"):
+            return {"name": "اکانت Railway تایید شده"}
+    except Exception:
+        pass
+
+    raise Exception("توکن نامعتبر است! لطفاً یک توکن معتبر از بخش Account Tokens ایجاد کنید.")
+
 def get_workspace_id(token: str) -> str:
-    """دریافت شناسه فضای کاری (Workspace ID) کاربر"""
-    # روش اول: دریافت مستقیم از me.workspaces
-    q1 = """
-    query {
-        me {
-            id
-            workspaces {
-                id
-                name
-            }
-        }
-    }
-    """
-    try:
-        data = execute_query(token, q1)
-        workspaces = data.get("me", {}).get("workspaces", [])
-        if workspaces and len(workspaces) > 0:
-            return workspaces[0]["id"]
-    except Exception:
-        pass
-
-    # روش دوم: دریافت از لیست عمومی workspaces
-    q2 = """
-    query {
-        workspaces {
-            id
-            name
-        }
-    }
-    """
-    try:
-        data = execute_query(token, q2)
-        workspaces = data.get("workspaces", [])
-        if workspaces and len(workspaces) > 0:
-            return workspaces[0]["id"]
-    except Exception:
-        pass
-
-    # روش سوم: حساب‌های قدیمی (teams)
-    q3 = """
-    query {
-        me {
-            teams {
-                id
-                name
-            }
-        }
-    }
-    """
-    try:
-        data = execute_query(token, q3)
-        teams = data.get("me", {}).get("teams", [])
-        if teams and len(teams) > 0:
-            return teams[0]["id"]
-    except Exception:
-        pass
-
+    queries = [
+        "query { me { workspaces { id } } }",
+        "query { workspaces { id } }",
+        "query { me { teams { id } } }"
+    ]
+    for q in queries:
+        try:
+            data = execute_query(token, q)
+            me_ws = data.get("me", {}).get("workspaces", []) if "me" in data else []
+            if me_ws: return me_ws[0]["id"]
+            
+            gen_ws = data.get("workspaces", [])
+            if gen_ws: return gen_ws[0]["id"]
+            
+            teams = data.get("me", {}).get("teams", []) if "me" in data else []
+            if teams: return teams[0]["id"]
+        except Exception:
+            continue
     return None
 
-def check_token(token: str):
-    """بررسی اعتبار توکن کاربر"""
-    query = """
-    query {
-        me {
-            id
-            email
-            name
-        }
-    }
-    """
-    data = execute_query(token, query)
-    return data.get("me")
-
 def deploy_panel_flow(token: str, project_name: str, github_repo: str):
-    """فرآیند کامل ساخت پروژه، اتصال به گیت‌هاب و دریافت دامنه"""
     repo = clean_repo(github_repo)
-
-    # دریافت شناسه Workspace کاربر
     workspace_id = get_workspace_id(token)
 
-    # ۱. ساخت پروژه با ارسال workspaceId
     create_proj_query = """
     mutation CreateProject($name: String!, $workspaceId: String) {
         projectCreate(input: { name: $name, workspaceId: $workspaceId }) {
@@ -140,7 +100,6 @@ def deploy_panel_flow(token: str, project_name: str, github_repo: str):
 
     time.sleep(2)
 
-    # ۲. ساخت سرویس متصل به ریپازیتوری
     create_srv_query = """
     mutation CreateService($projectId: String!, $repo: String!) {
         serviceCreate(input: {
@@ -160,10 +119,8 @@ def deploy_panel_flow(token: str, project_name: str, github_repo: str):
     })
     service_id = srv_data["serviceCreate"]["id"]
 
-    # چند ثانیه وقفه برای اعمال سرویس
     time.sleep(3)
 
-    # ۳. دریافت خودکار دامنه رایگان Railway
     create_domain_query = """
     mutation CreateDomain($environmentId: String!, $serviceId: String!) {
         serviceDomainCreate(input: {
@@ -192,12 +149,11 @@ def deploy_panel_flow(token: str, project_name: str, github_repo: str):
         "project_id": project_id,
         "project_name": project_name,
         "service_id": service_id,
-        "domain": domain_name if domain_name else "در حال ایجاد دامنه...",
+        "domain": domain_name if domain_name else "در حال راه‌اندازی...",
         "repo": repo
     }
 
 def delete_project_api(token: str, project_id: str):
-    """حذف کامل پروژه از Railway"""
     query = """
     mutation DeleteProject($id: String!) {
         projectDelete(id: $id)
